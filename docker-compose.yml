@@ -1,0 +1,26 @@
+version: "3.8"
+
+# Works with Rancher Desktop as long as its container engine is set to
+# "dockerd (moby)" (Rancher Desktop Settings -> Container Engine).
+# In that mode, the normal `docker` and `docker compose` commands work
+# exactly like they do with Docker Desktop -- nothing else changes.
+
+services:
+  zap:
+    image: zaproxy/zap-stable
+    container_name: zap-scanner
+    command: >
+      zap.sh -daemon
+      -host 0.0.0.0
+      -port 8080
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+      -config api.key=changeme123
+    ports:
+      - "8080:8080"
+    networks:
+      - zapnet
+
+networks:
+  zapnet:
+    driver: bridge
