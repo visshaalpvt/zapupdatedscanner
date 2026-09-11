@@ -48,6 +48,8 @@ def load_project_config(project_name):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True, help="Project name (folder under projects/)")
+    parser.add_argument("--zap-api-url", help="Override the project ZAP API URL for this run")
+    parser.add_argument("--zap-api-key", help="Override the project ZAP API key for this run")
     args = parser.parse_args()
 
     cfg = load_project_config(args.project)
@@ -56,7 +58,11 @@ def main():
     include_regex = cfg["target"]["include_regex"]
     auth = cfg.get("auth")
     scan_opts = cfg["scan"]
-    zap_cfg = cfg["zap"]
+    zap_cfg = cfg["zap"].copy()
+    if args.zap_api_url:
+        zap_cfg["api_url"] = args.zap_api_url
+    if args.zap_api_key:
+        zap_cfg["api_key"] = args.zap_api_key
 
     reports_dir = os.path.join(PROJECTS_DIR, project_name, "reports")
     timestamp = time.strftime("%Y%m%d_%H%M%S")

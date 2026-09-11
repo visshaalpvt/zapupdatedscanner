@@ -1,0 +1,4 @@
+[
+  {"name": "zap1", "api_url": "http://10.93.15.18:8080", "api_key": "changeme123", "max_concurrent": 3},
+  {"name": "zap2", "api_url": "http://10.53.15.9:8080", "api_key": "changeme123", "max_concurrent": 3}
+]

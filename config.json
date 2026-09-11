@@ -1,0 +1,16 @@
+{
+  "abc": {
+    "url": "http://10.53.56.20:8080/browser",
+    "username": "admin",
+    "password": "xyz",
+    "auth_method": "browser",
+    "logged_in_indicator": "Dashboard",
+    "logged_out_indicator": null
+  },
+  "pqr": {
+    "url": "http://10.53.15.9:5080/",
+    "username": "",
+    "password": "",
+    "auth_method": "none"
+  }
+}
