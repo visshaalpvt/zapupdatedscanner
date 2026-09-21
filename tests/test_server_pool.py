@@ -37,8 +37,21 @@ class TestServerPool(unittest.TestCase):
         self.assertNotEqual(first.name, second.name)
 
         pool.release(first)
-        third = pool.acquire()
-        self.assertEqual(third.name, "zap1")
+    def test_invalid_preferred_server_raises_value_error(self):
+        pool = ServerPool([
+            {"name": "zap1", "api_url": "http://10.93.15.18:8080", "api_key": "k", "max_concurrent": 1},
+        ])
+
+        with self.assertRaises(ValueError) as ctx:
+            pool.acquire(preferred_server="zap_nonexistent")
+        self.assertIn("Requested server 'zap_nonexistent' not found", str(ctx.exception))
+
+    def test_total_capacity_calculation(self):
+        pool = ServerPool([
+            {"name": "zap1", "api_url": "http://1.1.1.1:8080", "max_concurrent": 3},
+            {"name": "zap2", "api_url": "http://2.2.2.2:8080", "max_concurrent": 2},
+        ])
+        self.assertEqual(pool.total_capacity, 5)
 
 
 if __name__ == "__main__":

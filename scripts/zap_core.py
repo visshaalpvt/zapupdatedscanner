@@ -18,12 +18,185 @@ from zapv2 import ZAPv2
 
 
 # ---------------------------------------------------------------------
-# Connection
+# Local ZAP lifecycle
 # ---------------------------------------------------------------------
 
-def connect_zap(api_key="changeme123", api_url="http://localhost:8080"):
-    zap = ZAPv2(apikey=api_key, proxies={"http": api_url, "https": api_url})
-    print(f"[+] Connected to ZAP {zap.core.version}")
+ZAP_INSTALL_DIR = r"C:\Program Files\ZAP\Zed Attack Proxy"
+ZAP_BAT = os.path.join(ZAP_INSTALL_DIR, "zap.bat")
+
+_zap_process = None
+_zap_started_by_scanner = False
+
+
+def start_local_zap(api_key="zap-local-key", api_url="http://127.0.0.1:8080"):
+    """
+    Start a local ZAP daemon on Windows if one is not already running.
+
+    Returns:
+        subprocess.Popen object if this scanner started ZAP,
+        otherwise None if ZAP was already running.
+    """
+    global _zap_process, _zap_started_by_scanner
+
+    alive, info = check_zap_connection(
+        api_url=api_url,
+        api_key=api_key,
+        timeout=2,
+    )
+
+    if alive:
+        print(f"[+] ZAP is already running: version {info}")
+        _zap_started_by_scanner = False
+        return None
+
+    if not os.path.exists(ZAP_BAT):
+        raise FileNotFoundError(
+            f"ZAP was not found at:\n{ZAP_BAT}\n\n"
+            "Install ZAP 2.17.0 before running the scanner."
+        )
+
+    print("[+] Starting local ZAP daemon...")
+
+    _zap_process = subprocess.Popen(
+        [
+            "cmd.exe",
+            "/c",
+            ZAP_BAT,
+            "-daemon",
+            "-port",
+            "8080",
+            "-config",
+            f"api.key={api_key}",
+        ],
+        cwd=ZAP_INSTALL_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+
+    _zap_started_by_scanner = True
+
+    max_wait = 90
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait:
+        alive, info = check_zap_connection(
+            api_url=api_url,
+            api_key=api_key,
+            timeout=3,
+        )
+
+        if alive:
+            print(f"[+] Local ZAP is ready: version {info}")
+            return _zap_process
+
+        if _zap_process.poll() is not None:
+            raise RuntimeError("ZAP exited before its API became available.")
+
+        time.sleep(2)
+
+    raise TimeoutError(f"ZAP did not become ready within {max_wait} seconds.")
+
+
+def stop_local_zap(api_url="http://127.0.0.1:8080", api_key="zap-local-key"):
+    """
+    Stop ZAP only if this scanner started it.
+    """
+    global _zap_process, _zap_started_by_scanner
+
+    if not _zap_started_by_scanner:
+        return
+
+    print("[+] Shutting down local ZAP...")
+
+    try:
+        import urllib.request
+
+        shutdown_url = (
+            f"{api_url.rstrip('/')}/JSON/core/action/shutdown/"
+            f"?apikey={api_key}"
+        )
+
+        request = urllib.request.Request(shutdown_url)
+
+        try:
+            urllib.request.urlopen(request, timeout=5)
+        except Exception:
+            pass
+
+    finally:
+        if _zap_process is not None:
+            try:
+                _zap_process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                _zap_process.kill()
+
+        _zap_process = None
+        _zap_started_by_scanner = False
+        print("[+] Local ZAP stopped.")
+
+
+# ---------------------------------------------------------------------
+# Connection & Health Check
+# ---------------------------------------------------------------------
+
+def check_zap_connection(api_url="http://localhost:8080", api_key=None, timeout=5):
+    """Check if the ZAP daemon is online and responsive within timeout seconds.
+    Returns (True, version_str) if reachable, or (False, error_reason).
+    """
+    import urllib.request
+    import urllib.error
+    import json
+
+    base_url = api_url.rstrip("/")
+    probe_url = f"{base_url}/JSON/core/view/version/"
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["X-ZAP-API-Key"] = api_key
+
+    req = urllib.request.Request(probe_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode("utf-8"))
+                version = data.get("version", "unknown")
+                return True, version
+            return False, f"HTTP {response.status}"
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", str(e))
+        return False, str(reason)
+    except Exception as e:
+        return False, str(e)
+
+
+def connect_zap(
+    api_key="zap-local-key",
+    api_url="http://127.0.0.1:8080",
+    timeout=8,
+):
+    """Connect to the local ZAP daemon."""
+
+    is_alive, info = check_zap_connection(
+        api_url=api_url,
+        api_key=api_key,
+        timeout=timeout,
+    )
+
+    if not is_alive:
+        raise ConnectionError(
+            f"Cannot connect to ZAP at {api_url} (reason: {info})."
+        )
+
+    zap = ZAPv2(
+        apikey=api_key,
+        proxies={
+            "http": api_url,
+            "https": api_url,
+        },
+    )
+
+    print(f"[+] Connected to ZAP {info} at {api_url}")
+
     return zap
 
 
@@ -61,10 +234,12 @@ def _setup_form_auth(zap, context_id, auth):
     """Classic form-based auth: fakes a single POST request with
     username/password. Only works when the site's OWN server handles
     the login directly (no Firebase/Clerk/Auth0/Supabase in the middle)."""
-    login_url = auth["login_url"]
+    login_url = auth.get("login_url", "")
+    username_field = auth.get("username_field", "email")
+    password_field = auth.get("password_field", "password")
     login_request_data = (
-        f"{auth['username_field']}={{%username%}}&"
-        f"{auth['password_field']}={{%password%}}"
+        f"{username_field}={{%username%}}&"
+        f"{password_field}={{%password%}}"
     )
 
     zap.authentication.set_authentication_method(
@@ -72,20 +247,19 @@ def _setup_form_auth(zap, context_id, auth):
         authmethodname="formBasedAuthentication",
         authmethodconfigparams=f"loginUrl={login_url}&loginRequestData={login_request_data}",
     )
-    zap.authentication.set_logged_in_indicator(context_id, auth["logged_in_indicator"])
+    if auth.get("logged_in_indicator"):
+        zap.authentication.set_logged_in_indicator(context_id, str(auth["logged_in_indicator"]))
     if auth.get("logged_out_indicator"):
-        zap.authentication.set_logged_out_indicator(context_id, auth["logged_out_indicator"])
+        zap.authentication.set_logged_out_indicator(context_id, str(auth["logged_out_indicator"]))
 
     user_id = zap.users.new_user(context_id, "scan_user")
     zap.users.set_authentication_credentials(
-        context_id, user_id, f"username={auth['username']}&password={auth['password']}"
+        context_id, user_id, f"username={auth.get('username', '')}&password={auth.get('password', '')}"
     )
     zap.users.set_user_enabled(context_id, user_id, "true")
-
     zap.forcedUser.set_forced_user(context_id, user_id)
-    zap.forcedUser.set_forced_user_mode_enabled("true")
 
-    print("[+] Form-based authentication configured, forced-user mode enabled")
+    print("[+] Form-based authentication configured for context")
     return context_id, user_id
 
 
@@ -95,7 +269,7 @@ def _setup_browser_auth(zap, context_id, auth):
     the real rendered page, types the credentials in, and clicks submit --
     same as a human would. Works for Firebase/Clerk/Auth0/Supabase-style
     logins since it drives the real UI instead of faking a request."""
-    login_url = auth["login_url"]
+    login_url = auth.get("login_url", "")
     browser_id = auth.get("browser_id", "firefox-headless")
 
     zap.authentication.set_authentication_method(
@@ -103,18 +277,17 @@ def _setup_browser_auth(zap, context_id, auth):
         authmethodname="browserBasedAuthentication",
         authmethodconfigparams=f"loginPageUrl={login_url}&browserId={browser_id}",
     )
-    zap.authentication.set_logged_in_indicator(context_id, auth["logged_in_indicator"])
+    if auth.get("logged_in_indicator"):
+        zap.authentication.set_logged_in_indicator(context_id, str(auth["logged_in_indicator"]))
     if auth.get("logged_out_indicator"):
-        zap.authentication.set_logged_out_indicator(context_id, auth["logged_out_indicator"])
+        zap.authentication.set_logged_out_indicator(context_id, str(auth["logged_out_indicator"]))
 
     user_id = zap.users.new_user(context_id, "scan_user")
     zap.users.set_authentication_credentials(
-        context_id, user_id, f"username={auth['username']}&password={auth['password']}"
+        context_id, user_id, f"username={auth.get('username', '')}&password={auth.get('password', '')}"
     )
     zap.users.set_user_enabled(context_id, user_id, "true")
-
     zap.forcedUser.set_forced_user(context_id, user_id)
-    zap.forcedUser.set_forced_user_mode_enabled("true")
 
     print("[+] Browser-based authentication configured (real headless browser login)")
     print("[!] Note: first login attempt can take 20-40s -- ZAP is actually")
@@ -128,9 +301,18 @@ def _setup_browser_auth(zap, context_id, auth):
 
 def _wait_for(check_fn, label, poll_seconds=3):
     while True:
-        progress = check_fn()
+        raw_progress = check_fn()
+        try:
+            progress = int(raw_progress)
+        except (ValueError, TypeError):
+            if str(raw_progress).lower() in ("100", "completed", "complete", "stopped"):
+                progress = 100
+            else:
+                print(f"    [{label}] status: {raw_progress}")
+                time.sleep(poll_seconds)
+                continue
         print(f"    [{label}] progress: {progress}%")
-        if int(progress) >= 100:
+        if progress >= 100:
             break
         time.sleep(poll_seconds)
 
@@ -174,6 +356,7 @@ def save_html_report(zap, target_url, output_dir, filename):
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, filename)
     site = target_url.rstrip("/")
+    report_saved = False
 
     try:
         result = zap.reports.generate(
@@ -183,19 +366,25 @@ def save_html_report(zap, target_url, output_dir, filename):
             reportfilename=os.path.splitext(filename)[0],
             reportdir=os.path.abspath(output_dir),
         )
-        generated_path = result if isinstance(result, str) and os.path.exists(result) else out_path
-        print(f"[+] Report (scoped to {site}) saved to {generated_path}")
-        return generated_path
+        if isinstance(result, str) and os.path.exists(result):
+            report_saved = True
+            out_path = result
+            print(f"[+] Report (scoped to {site}) saved to {out_path}")
     except Exception as e:
-        print(f"[!] Scoped report unavailable ({e}); falling back to full-session report.")
-        if len(zap.core.sites) > 1:
-            print("[!] WARNING: other scans may be sharing this ZAP instance -- "
-                  "this fallback report may include their findings too.")
-        html_report = zap.core.htmlreport()
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html_report)
-        print(f"[+] Report saved to {out_path}")
-        return out_path
+        print(f"[!] Scoped report generation via reports add-on: {e}")
+
+    if not report_saved:
+        print(f"[+] Saving HTML report directly to client: {out_path}")
+        try:
+            html_report = zap.core.htmlreport()
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(html_report)
+            print(f"[+] Report saved to {out_path}")
+        except Exception as err:
+            print(f"[!] Failed to fetch HTML report: {err}")
+            raise
+
+    return out_path
 
 
 # ---------------------------------------------------------------------

@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ZAP Scanner Dashboard</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body { font-family: Arial, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+      .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+      .card { background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; }
+      .space-between { justify-content: space-between; align-items: center; }
+      input, button, textarea { padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #020817; color: white; }
+      button { cursor: pointer; background: #2563eb; border-color: #2563eb; }
+      button.secondary { background: transparent; border-color: #475569; }
+      button.danger { background: #b91c1c; border-color: #b91c1c; }
+      .project-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 12px; border: 1px solid #334155; border-radius: 8px; margin-top: 12px; cursor: pointer; }
+      .project-item:hover { border-color: #60a5fa; }
+      .status { padding: 4px 10px; border-radius: 999px; font-size: 12px; text-transform: uppercase; }
+      .status.queued { background: #f59e0b; color: black; }
+      .status.running { background: #3b82f6; }
+      .status.done { background: #22c55e; color: black; }
+      .status.failed { background: #ef4444; }
+      .status.default { background: #475569; }
+      .log { white-space: pre-wrap; font-family: monospace; background: #020817; border: 1px solid #334155; border-radius: 8px; padding: 12px; min-height: 120px; }
+      .hidden { display: none !important; }
+      .link { color: #7dd3fc; text-decoration: none; }
+      .detail-header { display: flex; justify-content: space-between; align-items: center; }
+      .detail-title { font-size: 1.5rem; margin: 0; }
+      .muted { color: #cbd5e1; }
+      .table { width: 100%; border-collapse: collapse; }
+      .table th, .table td { padding: 10px 8px; border-top: 1px solid #334155; text-align: left; }
+      .attachment-list { display: grid; gap: 10px; }
+      .attachment-item { display: flex; justify-content: space-between; align-items: center; border: 1px solid #334155; border-radius: 10px; padding: 10px 12px; }
+      .attachment-item a { color: #e2e8f0; text-decoration: none; }
+      .inline-form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+      .small { font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card" id="auth-panel">
+        <h2>Login</h2>
+        <div class="row">
+          <input id="username" value="admin" placeholder="Username" />
+          <input id="password" value="changeme" type="password" placeholder="Password" />
+          <button id="loginBtn">Sign in</button>
+        </div>
+      </div>
+
+      <div id="app" class="hidden">
+        <div class="card">
+          <h2>Register project</h2>
+          <div class="row">
+            <input id="projectName" placeholder="Project name" />
+            <input id="targetUrl" placeholder="https://example.com" style="min-width: 300px;" />
+            <label style="display:flex; align-items:center; gap:8px;">
+              <input id="projectNeedsAuth" type="checkbox" />
+              This site needs login
+            </label>
+            <button id="addProjectBtn">Add project</button>
+          </div>
+          <div id="projectAuthFields" class="card hidden" style="margin-top: 12px;">
+            <div class="row">
+              <input id="projectLoginUrl" placeholder="Login URL" style="min-width: 280px;" />
+              <input id="projectUsernameField" placeholder="Username field" value="email" />
+              <input id="projectPasswordField" placeholder="Password field" value="password" />
+            </div>
+            <div class="row" style="margin-top: 12px;">
+              <input id="projectUsername" placeholder="Target username" />
+              <input id="projectPassword" type="password" placeholder="Target password" />
+              <label style="display:flex; align-items:center; gap:8px;">
+                <input id="saveProjectCredentials" type="checkbox" />
+                Save credentials for this project
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Projects</h2>
+          <div id="projectList"></div>
+        </div>
+
+        <div class="card hidden" id="scanPanel">
+          <h2>Live scan</h2>
+          <div id="scanMeta"></div>
+          <div id="scanLog" class="log"></div>
+          <div id="reportSection" class="hidden">
+            <a id="reportLink" class="link" href="#" target="_blank">Open report</a>
+          </div>
+        </div>
+
+        <div class="card hidden" id="projectDetailPanel"></div>
+      </div>
+    </div>
+
+    <script>
+      const state = { username: '', password: '', token: '', currentScanId: null, activeProjectId: null };
+
+      function getProjectAuthConfigFromForm() {
+        const needsAuth = document.getElementById('projectNeedsAuth').checked;
+        if (!needsAuth) return null;
+        const username = document.getElementById('projectUsername').value.trim();
+        const password = document.getElementById('projectPassword').value.trim();
+        if (!username || !password) {
+          alert('Enter the target-site username and password before saving this project.');
+          return null;
+        }
+        return {
+          requires_auth: true,
+          login_url: document.getElementById('projectLoginUrl').value.trim() || document.getElementById('targetUrl').value.trim(),
+          username_field: document.getElementById('projectUsernameField').value.trim() || 'email',
+          password_field: document.getElementById('projectPasswordField').value.trim() || 'password',
+          username,
+          password,
+          save_credentials: document.getElementById('saveProjectCredentials').checked,
+        };
+      }
+
+      function getProjectAuthFromData(project) {
+        const auth = project && project.auth_config ? project.auth_config : null;
+        if (!auth) return null;
+        const requiresAuth = auth.requires_auth || !!(auth.username || auth.password || auth.login_url);
+        if (!requiresAuth) return null;
+        return {
+          requires_auth: true,
+          login_url: auth.login_url || project.target_url,
+          username_field: auth.username_field || 'email',
+          password_field: auth.password_field || 'password',
+          username: auth.username || '',
+          password: auth.password || '',
+        };
+      }
+
+      async function api(path, options = {}) {
+        const headers = { ...(options.headers || {}) };
+        if (state.token) {
+          headers.Authorization = `Bearer ${state.token}`;
+        }
+        const res = await fetch(path, { ...options, headers });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || 'Request failed');
+        }
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) return await res.json();
+        return await res.text();
+      }
+
+      function setAuthVisible(isLoggedIn) {
+        document.getElementById('auth-panel').classList.toggle('hidden', isLoggedIn);
+        document.getElementById('app').classList.toggle('hidden', !isLoggedIn);
+      }
+
+      async function login() {
+        state.username = document.getElementById('username').value;
+        state.password = document.getElementById('password').value;
+        try {
+          const data = await fetch('/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: state.username, password: state.password }),
+          });
+          const text = await data.text();
+          if (!data.ok) {
+            throw new Error(text || 'Login failed');
+          }
+          const payload = JSON.parse(text);
+          state.token = payload.token;
+          setAuthVisible(true);
+          loadProjects();
+        } catch (err) {
+          alert(err.message);
+        }
+      }
+
+      async function openReportInNewTab(scanId) {
+        const response = await fetch(`/scans/${scanId}/report`, {
+          headers: { Authorization: `Bearer ${state.token}` },
+        });
+        if (!response.ok) {
+          throw new Error('Failed to load report');
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+      }
+
+      function renderStatusChip(status) {
+        const safe = (status || 'queued').toLowerCase();
+        return `<span class="status ${safe}">${safe}</span>`;
+      }
+
+      async function loadProjects() {
+        const projects = await api('/projects');
+        const list = document.getElementById('projectList');
+        list.innerHTML = '';
+
+        for (const project of projects) {
+          const item = document.createElement('div');
+          item.className = 'project-item';
+          item.innerHTML = `
+            <div>
+              <strong>${project.name}</strong><br />
+              <small>${project.target_url}</small>
+            </div>
+            <div class="row">
+              ${renderStatusChip(project.last_status)}
+              <button data-project-id="${project.id}" class="secondary">Open</button>
+            </div>
+          `;
+          item.onclick = (event) => {
+            if (event.target.closest('button')) return;
+            openProjectDetail(project.id);
+          };
+          item.querySelector('button').onclick = async (e) => {
+            e.stopPropagation();
+            const projectId = project.id;
+            const data = await api(`/projects/${projectId}/scan`, { method: 'POST' });
+            const scanId = data.id;
+            openScanStream(scanId);
+            await loadProjects();
+            await openProjectDetail(projectId);
+          };
+          list.appendChild(item);
+        }
+      }
+
+      async function addProject() {
+        const authConfig = getProjectAuthConfigFromForm();
+        const payload = {
+          name: document.getElementById('projectName').value,
+          target_url: document.getElementById('targetUrl').value,
+          auth_config: authConfig,
+        };
+        await api('/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        document.getElementById('projectName').value = '';
+        document.getElementById('targetUrl').value = '';
+        document.getElementById('projectNeedsAuth').checked = false;
+        document.getElementById('projectAuthFields').classList.add('hidden');
+        document.getElementById('projectLoginUrl').value = '';
+        document.getElementById('projectUsernameField').value = 'email';
+        document.getElementById('projectPasswordField').value = 'password';
+        document.getElementById('projectUsername').value = '';
+        document.getElementById('projectPassword').value = '';
+        loadProjects();
+      }
+
+      async function loadProjectScans(projectId) {
+        const scans = await api(`/projects/${projectId}/scans`);
+        if (!scans.length) {
+          return '<p class="muted">No scans recorded yet.</p>';
+        }
+        return `
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Scan</th>
+                <th>Status</th>
+                <th>High/Med/Low</th>
+                <th>Date</th>
+                <th>Report</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${scans.map(scan => `
+                <tr>
+                  <td>#${scan.id}</td>
+                  <td>${renderStatusChip(scan.status)}</td>
+                  <td>${scan.high_count ?? 0} / ${scan.medium_count ?? 0} / ${scan.low_count ?? 0}</td>
+                  <td>${scan.created_at ? new Date(scan.created_at).toLocaleDateString() : '—'}</td>
+                  <td>${scan.report_path ? `<a class="link" href="#" data-report-scan="${scan.id}">View report</a>` : '—'}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `;
+      }
+
+      async function loadProjectAttachments(projectId) {
+        const attachments = await api(`/projects/${projectId}/attachments`);
+        if (!attachments.length) {
+          return '<p class="muted">No files or links yet.</p>';
+        }
+        return `
+          <div class="attachment-list">
+            ${attachments.map(att => {
+              const isLink = att.type === 'link';
+              const label = att.label || (isLink ? 'Link' : 'File');
+              const href = isLink ? att.url_or_path : `/projects/${projectId}/attachments/${att.id}`;
+              return `
+                <div class="attachment-item">
+                  <div>
+                    <div>${isLink ? '🔗' : '📄'} <a href="${href}" target="${isLink ? '_blank' : '_self'}" rel="noopener noreferrer">${label}</a></div>
+                    <div class="small muted">${new Date(att.uploaded_at).toLocaleDateString()}</div>
+                  </div>
+                  <button class="danger secondary" data-delete-attachment="${att.id}">Delete</button>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        `;
+      }
+
+      async function openProjectDetail(projectId) {
+        state.activeProjectId = projectId;
+        const project = await api(`/projects/${projectId}`);
+        const scansHtml = await loadProjectScans(projectId);
+        const attachmentsHtml = await loadProjectAttachments(projectId);
+        const panel = document.getElementById('projectDetailPanel');
+        panel.classList.remove('hidden');
+        const authConfig = getProjectAuthFromData(project);
+        const scanAuthVisible = !!authConfig;
+        panel.innerHTML = `
+          <div class="detail-header">
+            <button class="secondary" id="backToProjectsBtn">← Back</button>
+            <div>
+              <h2 class="detail-title">${project.name}</h2>
+              <div class="muted">${project.target_url}</div>
+            </div>
+            <button id="editProjectBtn" class="secondary">Edit target</button>
+          </div>
+          <div class="row" style="margin-top: 16px;">
+            <button id="startProjectScanBtn">Start scan</button>
+            <button id="editProjectInlineBtn" class="secondary">Edit target</button>
+          </div>
+
+          <div id="scanAuthFields" class="card ${scanAuthVisible ? '' : 'hidden'}" style="margin-top: 18px;">
+            <h3>Target login</h3>
+            <div class="row">
+              <input id="scanLoginUrl" placeholder="Login URL" value="${(authConfig && authConfig.login_url) || project.target_url || ''}" style="min-width: 280px;" />
+              <input id="scanUsernameField" placeholder="Username field" value="${(authConfig && authConfig.username_field) || 'email'}" />
+              <input id="scanPasswordField" placeholder="Password field" value="${(authConfig && authConfig.password_field) || 'password'}" />
+            </div>
+            <div class="row" style="margin-top: 12px;">
+              <input id="scanUsername" placeholder="Target username" value="${(authConfig && authConfig.username) || ''}" />
+              <input id="scanPassword" type="password" placeholder="Target password" value="${(authConfig && authConfig.password) || ''}" />
+            </div>
+            <div class="row" style="margin-top: 12px;">
+              <button id="saveScanAuthBtn" class="secondary">Save these credentials for this project</button>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top: 18px;">
+            <h3>Scan history</h3>
+            ${scansHtml}
+          </div>
+
+          <div class="card">
+            <h3>Attachments & links</h3>
+            <div class="inline-form">
+              <input id="attachmentLinkLabel" placeholder="Link label" />
+              <input id="attachmentLinkUrl" placeholder="https://example.com" style="min-width: 260px;" />
+              <button id="addLinkBtn" class="secondary">+ Add link</button>
+            </div>
+            <div class="inline-form">
+              <input id="attachmentFileInput" type="file" />
+              <button id="uploadFileBtn" class="secondary">+ Upload file</button>
+            </div>
+            ${attachmentsHtml}
+          </div>
+        `;
+
+        document.getElementById('backToProjectsBtn').onclick = () => {
+          panel.classList.add('hidden');
+          panel.innerHTML = '';
+        };
+
+        document.getElementById('startProjectScanBtn').onclick = async () => {
+          const authCfg = getProjectAuthFromData(project);
+          const payload = {};
+          if (authCfg) {
+            payload.auth_config = authCfg;
+          } else {
+            const loginUrl = document.getElementById('scanLoginUrl') ? document.getElementById('scanLoginUrl').value.trim() : '';
+            const username = document.getElementById('scanUsername') ? document.getElementById('scanUsername').value.trim() : '';
+            const password = document.getElementById('scanPassword') ? document.getElementById('scanPassword').value.trim() : '';
+            if (loginUrl || username || password) {
+              payload.auth_config = {
+                requires_auth: true,
+                login_url: loginUrl || project.target_url,
+                username_field: (document.getElementById('scanUsernameField') || {}).value || 'email',
+                password_field: (document.getElementById('scanPasswordField') || {}).value || 'password',
+                username,
+                password,
+              };
+            }
+          }
+          const data = await api(`/projects/${projectId}/scan`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          openScanStream(data.id);
+          await openProjectDetail(projectId);
+        };
+
+        const applyEdit = async () => {
+          const name = prompt('Project name', project.name);
+          if (name === null) return;
+          const target = prompt('Target URL', project.target_url);
+          if (target === null) return;
+          await api(`/projects/${projectId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, target_url: target, auth_config: project.auth_config })
+          });
+          await openProjectDetail(projectId);
+          await loadProjects();
+        };
+
+        document.getElementById('editProjectBtn').onclick = applyEdit;
+        document.getElementById('editProjectInlineBtn').onclick = applyEdit;
+
+        const saveScanAuth = document.getElementById('saveScanAuthBtn');
+        if (saveScanAuth) {
+          saveScanAuth.onclick = async () => {
+            const authConfig = {
+              requires_auth: true,
+              login_url: document.getElementById('scanLoginUrl').value.trim() || project.target_url,
+              username_field: document.getElementById('scanUsernameField').value.trim() || 'email',
+              password_field: document.getElementById('scanPasswordField').value.trim() || 'password',
+              username: document.getElementById('scanUsername').value.trim(),
+              password: document.getElementById('scanPassword').value.trim(),
+            };
+            if (!authConfig.username || !authConfig.password) {
+              alert('Provide the target username and password before saving.');
+              return;
+            }
+            await api(`/projects/${projectId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ auth_config: authConfig })
+            });
+            await openProjectDetail(projectId);
+          };
+        }
+
+        document.getElementById('addLinkBtn').onclick = async () => {
+          const label = document.getElementById('attachmentLinkLabel').value.trim();
+          const url = document.getElementById('attachmentLinkUrl').value.trim();
+          if (!label || !url) {
+            alert('Link label and URL are required');
+            return;
+          }
+          await api(`/projects/${projectId}/attachments`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ label, url })
+          });
+          await openProjectDetail(projectId);
+        };
+
+        document.getElementById('uploadFileBtn').onclick = async () => {
+          const input = document.getElementById('attachmentFileInput');
+          const file = input.files && input.files[0];
+          if (!file) {
+            alert('Choose a file first');
+            return;
+          }
+          const formData = new FormData();
+          formData.append('file', file);
+          formData.append('label', file.name);
+          await fetch(`/projects/${projectId}/attachments`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${state.token}` },
+            body: formData,
+          });
+          input.value = '';
+          await openProjectDetail(projectId);
+        };
+
+        panel.querySelectorAll('[data-report-scan]').forEach(link => {
+          link.onclick = async (event) => {
+            event.preventDefault();
+            const scanId = link.dataset.reportScan;
+            await openReportInNewTab(scanId);
+          };
+        });
+
+        panel.querySelectorAll('[data-delete-attachment]').forEach(button => {
+          button.onclick = async () => {
+            const attachmentId = button.dataset.deleteAttachment;
+            await fetch(`/projects/${projectId}/attachments/${attachmentId}`, {
+              method: 'DELETE',
+              headers: { Authorization: `Bearer ${state.token}` },
+            });
+            await openProjectDetail(projectId);
+          };
+        });
+      }
+
+      async function openScanStream(scanId) {
+        state.currentScanId = scanId;
+        const panel = document.getElementById('scanPanel');
+        panel.classList.remove('hidden');
+        const logEl = document.getElementById('scanLog');
+        logEl.textContent = 'Connecting to scan stream...\n';
+
+        const ws = new WebSocket(`ws://${location.host}/scans/${scanId}/stream`);
+        ws.onmessage = (event) => {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'log') {
+            logEl.textContent += `${payload.message}\n`;
+          }
+          if (payload.type === 'done') {
+            const reportLink = document.getElementById('reportLink');
+            reportLink.onclick = async (event) => {
+              event.preventDefault();
+              await openReportInNewTab(scanId);
+            };
+            reportLink.href = '#';
+            document.getElementById('reportSection').classList.remove('hidden');
+            logEl.textContent += '\nScan complete.\n';
+          }
+        };
+
+        const scan = await api(`/scans/${scanId}`);
+        document.getElementById('scanMeta').textContent = `Scan ID: ${scan.id} | Status: ${scan.status} | Phase: ${scan.phase}`;
+        if (scan.report_path) {
+          const reportLink = document.getElementById('reportLink');
+          reportLink.onclick = async (event) => {
+            event.preventDefault();
+            await openReportInNewTab(scanId);
+          };
+          reportLink.href = '#';
+          document.getElementById('reportSection').classList.remove('hidden');
+        }
+      }
+
+      document.getElementById('loginBtn').onclick = login;
+      document.getElementById('projectNeedsAuth').addEventListener('change', () => {
+        document.getElementById('projectAuthFields').classList.toggle('hidden', !document.getElementById('projectNeedsAuth').checked);
+      });
+      document.getElementById('addProjectBtn').onclick = addProject;
+      setAuthVisible(false);
+    </script>
+  </body>
+</html>

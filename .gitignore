@@ -1,6 +1,9 @@
 RancherDesktopSetup.msi
 __pycache__/
 *.py[cod]
+.env
+.env.*
+!.env.example
 
 # Project-specific configurations may contain credentials.
 projects/*/config/

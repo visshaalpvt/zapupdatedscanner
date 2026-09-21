@@ -1,14 +1,41 @@
-version: "3.8"
-
-# Works with Rancher Desktop as long as its container engine is set to
-# "dockerd (moby)" (Rancher Desktop Settings -> Container Engine).
-# In that mode, the normal `docker` and `docker compose` commands work
-# exactly like they do with Docker Desktop -- nothing else changes.
+version: "3.9"
 
 services:
-  zap:
+  api:
+    build: .
+    command: uvicorn server.app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////app/zap_dashboard.db
+      ZAP_AUTH_ENCRYPTION_KEY: h47OImZGM-IqQk4sGM8j_IeOc5YB-uWdAoTQnHTxN9A
+      ZAP_NODE_NAME: zap1
+    volumes:
+      - .:/app
+    depends_on:
+      - zap1
+      - zap2
+    networks:
+      - appnet
+
+  worker:
+    build: .
+    command: python worker/main.py
+    environment:
+      DATABASE_URL: sqlite:////app/zap_dashboard.db
+      ZAP_AUTH_ENCRYPTION_KEY: h47OImZGM-IqQk4sGM8j_IeOc5YB-uWdAoTQnHTxN9A
+      ZAP_NODE_URL: http://zap1:8080
+    volumes:
+      - .:/app
+    depends_on:
+      - zap1
+      - zap2
+    networks:
+      - appnet
+
+  zap1:
     image: zaproxy/zap-stable
-    container_name: zap-scanner
+    container_name: zap1
     command: >
       zap.sh -daemon
       -host 0.0.0.0
@@ -16,11 +43,26 @@ services:
       -config api.addrs.addr.name=.*
       -config api.addrs.addr.regex=true
       -config api.key=changeme123
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
     networks:
-      - zapnet
+      - appnet
+
+  zap2:
+    image: zaproxy/zap-stable
+    container_name: zap2
+    command: >
+      zap.sh -daemon
+      -host 0.0.0.0
+      -port 8080
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+      -config api.key=changeme123
+    expose:
+      - "8080"
+    networks:
+      - appnet
 
 networks:
-  zapnet:
+  appnet:
     driver: bridge

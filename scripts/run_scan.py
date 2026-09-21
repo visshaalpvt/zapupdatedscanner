@@ -6,11 +6,11 @@ Runs the full ZAP pipeline (spider -> AJAX spider -> active scan ->
 scoped HTML report) for a named project created with new_project.py.
 
 Usage:
-    py scripts\\run_scan.py --project uxpb_project
+    py scripts\\run_scan.py --project jharkhandtourism_vercel
 
-Run this from as many terminals/folders as you like at once (against
-different projects) -- they all share the one ZAP daemon on
-localhost:8080, so just make sure `docker compose up -d` was run once.
+This script starts a local ZAP daemon when needed, connects using the
+project's API key, runs the configured scan, and shuts ZAP down in
+finally so the machine is left clean for the next run.
 
 Only run this against targets you own or are explicitly authorized to test.
 """
@@ -23,6 +23,8 @@ import time
 import yaml
 
 from zap_core import (
+    start_local_zap,
+    stop_local_zap,
     connect_zap,
     setup_context_and_auth,
     run_spider,
@@ -32,7 +34,11 @@ from zap_core import (
     notify_completion,
 )
 
-PROJECTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "projects")
+try:
+    from paths import app_root
+except ImportError:
+    from scripts.paths import app_root
+PROJECTS_DIR = os.path.join(str(app_root()), "projects")
 
 
 def load_project_config(project_name):
@@ -73,27 +79,87 @@ def main():
     print(f"TARGET:  {target_url}")
     print("=" * 70)
 
-    zap = connect_zap(api_key=zap_cfg["api_key"], api_url=zap_cfg["api_url"])
+    try:
+        start_local_zap(
+            api_key=zap_cfg["api_key"],
+            api_url=zap_cfg["api_url"],
+        )
 
-    zap.urlopen(target_url)
-    time.sleep(2)
+        zap = connect_zap(
+            api_key=zap_cfg["api_key"],
+            api_url=zap_cfg["api_url"],
+        )
 
-    context_id, user_id = setup_context_and_auth(
-        zap, project_name, target_url, include_regex, auth
-    )
+    except ConnectionError as err:
+        print(f"[!] {err}")
+        return 1
 
-    run_spider(zap, target_url, context_id, user_id)
+    except Exception as err:
+        print(f"[!] Failed to start/connect to local ZAP: {err}")
+        return 1
 
-    if scan_opts.get("ajax_spider", True):
-        run_ajax_spider(zap, target_url)
+    try:
+        print(f"[+] Opening target URL: {target_url}")
+        zap.urlopen(target_url)
+        time.sleep(2)
 
-    if scan_opts.get("active_scan", True):
-        run_active_scan(zap, target_url, context_id, user_id)
+        context_id, user_id = setup_context_and_auth(
+            zap,
+            project_name,
+            target_url,
+            include_regex,
+            auth,
+        )
 
-    report_path = save_html_report(zap, target_url, reports_dir, report_filename)
+        run_spider(
+            zap,
+            target_url,
+            context_id,
+            user_id,
+        )
 
-    notify_completion(project_name, report_path)
+        if scan_opts.get("ajax_spider", True):
+            run_ajax_spider(
+                zap,
+                target_url,
+            )
+
+        if scan_opts.get("active_scan", True):
+            run_active_scan(
+                zap,
+                target_url,
+                context_id,
+                user_id,
+            )
+
+        report_path = save_html_report(
+            zap,
+            target_url,
+            reports_dir,
+            report_filename,
+        )
+
+        notify_completion(
+            project_name,
+            report_path,
+        )
+
+        return 0
+
+    except KeyboardInterrupt:
+        print("\n[!] Scan interrupted by user.")
+        return 130
+
+    except Exception as err:
+        print(f"\n[!] Scan failed with error: {err}")
+        return 1
+
+    finally:
+        stop_local_zap(
+            api_url=zap_cfg["api_url"],
+            api_key=zap_cfg["api_key"],
+        )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() or 0)

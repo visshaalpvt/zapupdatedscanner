@@ -1,2 +1,6 @@
 python-owasp-zap-v2.4
 PyYAML
+fastapi
+uvicorn
+python-multipart
+cryptography

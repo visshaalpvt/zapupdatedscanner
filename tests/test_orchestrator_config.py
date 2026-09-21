@@ -42,6 +42,34 @@ class TestProjectConfig(unittest.TestCase):
 
         self.assertIsNone(cfg["auth"])
 
+    def test_normalize_product_entry_defaults_project_name_to_product_key(self):
+        from scripts.orchestrate import normalize_product_entry
+        entry = {
+            "url": "http://10.53.56.20:8080/browser",
+            "username": "admin",
+            "password": "xyz",
+            "auth_method": "browser",
+        }
+        res = normalize_product_entry("my_product", entry)
+        self.assertEqual(res["name"], "my_product")
+        self.assertEqual(res["project_name"], "my_product")
+        self.assertEqual(res["url"], "http://10.53.56.20:8080/browser")
+        self.assertEqual(res["auth"]["method"], "browser")
+
+    def test_normalize_product_entry_preserves_explicit_project_name(self):
+        from scripts.orchestrate import normalize_product_entry
+        entry = {
+            "url": "http://example.com",
+            "project_name": "custom_proj",
+        }
+        res = normalize_product_entry("prod", entry)
+        self.assertEqual(res["project_name"], "custom_proj")
+
+    def test_normalize_product_entry_missing_url_raises(self):
+        from scripts.orchestrate import normalize_product_entry
+        with self.assertRaises(ValueError):
+            normalize_product_entry("bad_prod", {})
+
 
 if __name__ == "__main__":
     unittest.main()

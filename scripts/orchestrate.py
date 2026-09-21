@@ -4,6 +4,7 @@
 import argparse
 import concurrent.futures
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -15,10 +16,22 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from new_project import create_project, derive_project_name
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+try:
+    from paths import app_root
+except ImportError:
+    from scripts.paths import app_root
+ROOT_DIR = app_root()
 PROJECTS_DIR = ROOT_DIR / "projects"
 CONFIG_PATH = ROOT_DIR / "config.json"
 SERVER_POOL_PATH = ROOT_DIR / "zap_servers.json"
+
+
+print_lock = threading.Lock()
+
+
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
 
 
 class ServerSlot:
@@ -39,6 +52,11 @@ class ServerSlot:
     def release(self):
         self.in_use = max(self.in_use - 1, 0)
 
+    def check_health(self, timeout=3):
+        """Returns (is_healthy, message)"""
+        from zap_core import check_zap_connection
+        return check_zap_connection(api_url=self.api_url, api_key=self.api_key, timeout=timeout)
+
 
 class ServerPool:
     def __init__(self, servers):
@@ -58,6 +76,10 @@ class ServerPool:
         return sum(server.max_concurrent for server in self.servers)
 
     def acquire(self, preferred_server=None):
+        if preferred_server and not any(s.name == preferred_server for s in self.servers):
+            valid_names = [s.name for s in self.servers]
+            raise ValueError(f"Requested server '{preferred_server}' not found in server pool: {valid_names}")
+
         with self._condition:
             while True:
                 candidates = self.servers
@@ -74,6 +96,13 @@ class ServerPool:
         with self._condition:
             server.release()
             self._condition.notify_all()
+
+    def check_all_health(self, timeout=3):
+        """Check health of all servers in the pool. Returns dict of name -> (healthy, info)."""
+        health_results = {}
+        for server in self.servers:
+            health_results[server.name] = server.check_health(timeout=timeout)
+        return health_results
 
 
 def load_config(path=CONFIG_PATH):
@@ -110,6 +139,7 @@ def normalize_product_entry(name, entry):
     auth = None
     if auth_method != "none" and (username or password):
         auth = {
+            "method": auth_method,
             "auth_method": auth_method,
             "username": username,
             "password": password,
@@ -121,11 +151,15 @@ def normalize_product_entry(name, entry):
             auth["username_field"] = entry.get("username_field") or "email"
             auth["password_field"] = entry.get("password_field") or "password"
 
+    # Prefer explicit project_name, then product dictionary key 'name', else derive from URL
+    sanitized_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(name).strip()).strip("_")
+    project_name = entry.get("project_name") or sanitized_key or derive_project_name(url)
+
     return {
         "name": name,
         "url": url,
         "auth": auth,
-        "project_name": entry.get("project_name") or derive_project_name(url),
+        "project_name": project_name,
     }
 
 
@@ -142,11 +176,28 @@ def run_scan_for_product(product_name, url, auth, project_name, zap_server=None)
     if not project_dir.exists():
         ensure_project({"project_name": project_name, "url": url, "auth": auth})
 
-    cmd = [sys.executable, str(ROOT_DIR / "scripts" / "run_scan.py"), "--project", project_name]
+    if getattr(sys, "frozen", False):  # running as an .exe: start zapscan.exe from the sibling dist folder
+        cmd = [str(Path(sys.executable).resolve().parent.parent / "zapscan" / "zapscan.exe"), "--project", project_name]
+    else:
+        cmd = [sys.executable, str(ROOT_DIR / "scripts" / "run_scan.py"), "--project", project_name]
     if zap_server:
         cmd.extend(["--zap-api-url", zap_server.api_url, "--zap-api-key", zap_server.api_key])
-    print(f"\n=== START {project_name} :: {url} on {zap_server.name if zap_server else 'default'} ===")
-    process = subprocess.run(cmd, cwd=str(ROOT_DIR), capture_output=False)
+    safe_print(f"\n=== START {project_name} :: {url} on {zap_server.name if zap_server else 'default'} ===")
+
+    # Run subprocess with stdout/stderr piped and prefixed for clean concurrent output
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if process.stdout:
+        for line in process.stdout:
+            safe_print(f"[{project_name}] {line}", end="")
+    process.wait()
+
     return {
         "project_name": project_name,
         "url": url,
@@ -155,7 +206,7 @@ def run_scan_for_product(product_name, url, auth, project_name, zap_server=None)
     }
 
 
-def orchestrate(config_path=CONFIG_PATH, server_pool_path=SERVER_POOL_PATH, only=None, server_name=None):
+def orchestrate(config_path=CONFIG_PATH, server_pool_path=SERVER_POOL_PATH, only=None, server_name=None, check_health=True):
     products = load_config(config_path)
     if not isinstance(products, dict):
         raise ValueError("config.json must contain an object keyed by product name")
@@ -169,10 +220,27 @@ def orchestrate(config_path=CONFIG_PATH, server_pool_path=SERVER_POOL_PATH, only
         selected.append(normalize_product_entry(name, entry))
 
     if not selected:
-        print("[!] No matching products to scan")
+        safe_print("[!] No matching products to scan")
         return 0
 
     pool = load_server_pool(server_pool_path)
+
+    # Server health checks before dispatching
+    if check_health:
+        safe_print("[*] Checking ZAP server pool connectivity...")
+        health = pool.check_all_health(timeout=4)
+        online_count = 0
+        for s_name, (is_online, info) in health.items():
+            if is_online:
+                safe_print(f"  [+] {s_name}: ONLINE (ZAP {info})")
+                online_count += 1
+            else:
+                safe_print(f"  [-] {s_name}: OFFLINE ({info})")
+        if online_count == 0:
+            safe_print("[!] WARNING: All configured ZAP servers are currently OFFLINE/unreachable.")
+            safe_print("    Please ensure ZAP daemon is running or check your network/VPN connection.")
+            safe_print("    To run a local ZAP daemon: docker compose up -d\n")
+
     results = []
     lock = threading.Lock()
     completed = 0
@@ -194,7 +262,7 @@ def orchestrate(config_path=CONFIG_PATH, server_pool_path=SERVER_POOL_PATH, only
             pool.release(assigned_server)
         with lock:
             completed += 1
-            print(f"[{completed}/{total}] COMPLETE {result['project_name']} on {result['server']} rc={result['return_code']}")
+            safe_print(f"\n[{completed}/{total}] COMPLETE {result['project_name']} on {result['server']} rc={result['return_code']}")
         results.append(result)
         return result
 
@@ -204,11 +272,11 @@ def orchestrate(config_path=CONFIG_PATH, server_pool_path=SERVER_POOL_PATH, only
             future.result()
 
     failed = [r for r in results if r["return_code"] != 0]
-    print("\n=== SUMMARY ===")
+    safe_print("\n=== SUMMARY ===")
     for item in results:
         status = "OK" if item["return_code"] == 0 else f"FAIL ({item['return_code']})"
-        print(f"- {item['project_name']}: {status} on {item['server']} :: {item['url']}")
-    print(f"Total: {len(results)} | Succeeded: {len(results)-len(failed)} | Failed: {len(failed)}")
+        safe_print(f"- {item['project_name']}: {status} on {item['server']} :: {item['url']}")
+    safe_print(f"Total: {len(results)} | Succeeded: {len(results)-len(failed)} | Failed: {len(failed)}")
     return 0 if not failed else 1
 
 
@@ -218,9 +286,18 @@ def main():
     parser.add_argument("--servers", default=str(SERVER_POOL_PATH), help="Path to zap_servers.json")
     parser.add_argument("--only", help="Comma-separated project names to run, e.g. abc,pqr")
     parser.add_argument("--server", dest="server_name", help="Force scans onto a specific ZAP server name from zap_servers.json")
+    parser.add_argument("--check-servers", action="store_true", help="Probe all servers in zap_servers.json and report connectivity without running scans")
     args = parser.parse_args()
-
     try:
+        if args.check_servers:
+            pool = load_server_pool(Path(args.servers))
+            safe_print("[*] Probing ZAP server pool connectivity...")
+            health = pool.check_all_health(timeout=4)
+            for s_name, (is_online, info) in health.items():
+                status_label = f"ONLINE (ZAP {info})" if is_online else f"OFFLINE ({info})"
+                safe_print(f"  [{'+' if is_online else '-'}] {s_name}: {status_label}")
+            return 0
+
         return orchestrate(
             config_path=Path(args.config),
             server_pool_path=Path(args.servers),
